@@ -124,6 +124,9 @@ class VulnCorrelationMatrix:
             cve_details_data = self.fetch_cve_details_data(cve_id)
 
 
+            # The second update wins on any shared key, so where the
+            # two sources disagree the scraped page silently replaces
+            # the NVD value in the stored record.
             if nvd_data:
                 self.vulnerability_data[cve_id].update(nvd_data)
             if cve_details_data:
@@ -148,6 +151,10 @@ class VulnCorrelationMatrix:
                 if 'affected_products' in self.vulnerability_data[cve1] and 'affected_products' in self.vulnerability_data[cve2]:
                     products1 = self.vulnerability_data[cve1]['affected_products']
                     products2 = self.vulnerability_data[cve2]['affected_products']
+                    # A product counts as shared only when vendor,
+                    # product, and version all match as an identical
+                    # dict. The same product on neighbouring versions
+                    # gives no correlation at all.
                     common_products = [p for p in products1 if p in products2]  # Simple check
 
                     if common_products:
@@ -156,6 +163,10 @@ class VulnCorrelationMatrix:
                         logging.info(f"Correlation found between {cve1} and {cve2} based on common products.")
 
                 # Example: Correlate based on CWE
+                # This branch is effectively dead. The NVD record I
+                # store carries weaknesses under a different shape and
+                # the CVE Details merge adds only score and products, so
+                # neither side ever holds a plain cwe key to compare.
                 if 'cwe' in self.vulnerability_data[cve1] and 'cwe' in self.vulnerability_data[cve2]:
                     cwe1 = self.vulnerability_data[cve1]['cwe']['name']  # Assuming CWE name is what we want. May need parsing.
                     cwe2 = self.vulnerability_data[cve2]['cwe']['name']
