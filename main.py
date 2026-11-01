@@ -2,6 +2,7 @@ import argparse
 import logging
 import json
 import requests
+import sys
 from bs4 import BeautifulSoup
 from collections import defaultdict
 
@@ -16,7 +17,7 @@ CVE_DETAILS_BASE_URL = "https://www.cvedetails.com/cve/" # Example
 class VulnCorrelationMatrix:
     """
     Generates a correlation matrix based on vulnerability metadata.
-    Aggregates data from NVD, CVE Details, and (potentially) Exploit-DB.
+    Aggregates data from NVD and CVE Details.
     """
 
     def __init__(self, cve_ids=None,  nvd_api_key=None):
@@ -48,7 +49,7 @@ class VulnCorrelationMatrix:
                 headers['apiKey'] = self.nvd_api_key
             url = f"{NVD_API_BASE_URL}?cveId={cve_id}"
             logging.info(f"Fetching NVD data for {cve_id} from {url}")
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
 
             data = response.json()
@@ -80,7 +81,7 @@ class VulnCorrelationMatrix:
         try:
             url = f"{CVE_DETAILS_BASE_URL}{cve_id}"
             logging.info(f"Fetching CVE Details data for {cve_id} from {url}")
-            response = requests.get(url)
+            response = requests.get(url, timeout=10)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'html.parser')
 
@@ -136,6 +137,45 @@ class VulnCorrelationMatrix:
 
             logging.debug(f"Aggregated data for {cve_id}: {self.vulnerability_data[cve_id]}")
 
+
+    @staticmethod
+    def extract_cwes(data):
+        """Collects CWE identifiers from an NVD v2 weaknesses list, plus a plain cwe entry if present."""
+        cwes = set()
+        for weakness in (data or {}).get('weaknesses') or []:
+            for desc in weakness.get('description') or []:
+                value = desc.get('value') or ''
+                if value.startswith('CWE-'):
+                    cwes.add(value)
+        plain = (data or {}).get('cwe')
+        if isinstance(plain, dict) and plain.get('name'):
+            cwes.add(plain['name'])
+        elif isinstance(plain, str) and plain.startswith('CWE-'):
+            cwes.add(plain)
+        return cwes
+
+    @staticmethod
+    def cvss_score_of(data):
+        """Reads a CVSS base score from an NVD v2 metrics structure or a CVE Details cvss_score field."""
+        if not data:
+            return None
+        metrics = data.get('metrics') or {}
+        for key in ('cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2'):
+            entries = metrics.get(key) or []
+            if entries:
+                score = (entries[0].get('cvssData') or {}).get('baseScore')
+                if score is not None:
+                    return score
+        if data.get('cvss_score') is not None:
+            return data.get('cvss_score')
+        return None
+
+    def ranked_vulnerabilities(self):
+        """Ranks the aggregated CVEs by CVSS score, highest first; unscored CVEs sort last."""
+        ranked = [{'cve_id': cve_id, 'cvss_score': self.cvss_score_of(data)} for cve_id, data in self.vulnerability_data.items()]
+        ranked.sort(key=lambda item: (item['cvss_score'] is None, -(item['cvss_score'] or 0)))
+        return ranked
+
     def correlate_vulnerabilities(self):
         """
         Correlates vulnerabilities based on common metadata (e.g., affected software, CWE).
@@ -147,33 +187,27 @@ class VulnCorrelationMatrix:
                 cve1 = cve_ids[i]
                 cve2 = cve_ids[j]
 
-                # Example: Correlate based on affected products
+                # Correlate based on affected products, compared on
+                # vendor and product; version is a separate attribute
+                # and does not block a correlation.
                 if 'affected_products' in self.vulnerability_data[cve1] and 'affected_products' in self.vulnerability_data[cve2]:
                     products1 = self.vulnerability_data[cve1]['affected_products']
                     products2 = self.vulnerability_data[cve2]['affected_products']
-                    # A product counts as shared only when vendor,
-                    # product, and version all match as an identical
-                    # dict. The same product on neighbouring versions
-                    # gives no correlation at all.
-                    common_products = [p for p in products1 if p in products2]  # Simple check
-
-                    if common_products:
+                    keys1 = {(p.get('vendor'), p.get('product')) for p in products1}
+                    keys2 = {(p.get('vendor'), p.get('product')) for p in products2}
+                    if keys1 & keys2:
                         self.correlation_matrix[cve1][cve2] += 1
                         self.correlation_matrix[cve2][cve1] += 1
                         logging.info(f"Correlation found between {cve1} and {cve2} based on common products.")
 
-                # Example: Correlate based on CWE
-                # This branch is effectively dead. The NVD record I
-                # store carries weaknesses under a different shape and
-                # the CVE Details merge adds only score and products, so
-                # neither side ever holds a plain cwe key to compare.
-                if 'cwe' in self.vulnerability_data[cve1] and 'cwe' in self.vulnerability_data[cve2]:
-                    cwe1 = self.vulnerability_data[cve1]['cwe']['name']  # Assuming CWE name is what we want. May need parsing.
-                    cwe2 = self.vulnerability_data[cve2]['cwe']['name']
-                    if cwe1 == cwe2:
-                        self.correlation_matrix[cve1][cve2] += 1
-                        self.correlation_matrix[cve2][cve1] += 1
-                        logging.info(f"Correlation found between {cve1} and {cve2} based on common CWE {cwe1}.")
+                # Correlate based on CWE values parsed from the fetched data.
+                cwes1 = self.extract_cwes(self.vulnerability_data[cve1])
+                cwes2 = self.extract_cwes(self.vulnerability_data[cve2])
+                common_cwes = cwes1 & cwes2
+                if common_cwes:
+                    self.correlation_matrix[cve1][cve2] += 1
+                    self.correlation_matrix[cve2][cve1] += 1
+                    logging.info(f"Correlation found between {cve1} and {cve2} based on common CWE {sorted(common_cwes)[0]}.")
 
 
     def generate_report(self, output_format="text"):
@@ -199,9 +233,14 @@ class VulnCorrelationMatrix:
             report = "Invalid Output Format Selected" # Or raise an Exception
 
 
-        # (Placeholder) Add Vulnerability Ranking (Based on CVSS, exploit availability, etc.)
-        # Could also add report sections with other metrics.
-
+        ranked = self.ranked_vulnerabilities()
+        if output_format == "text":
+            report += "\nRanked Vulnerabilities (by CVSS score):\n"
+            for item in ranked:
+                score_text = item['cvss_score'] if item['cvss_score'] is not None else "no CVSS score available"
+                report += f"  - {item['cve_id']}: {score_text}\n"
+        elif output_format == "json":
+            report = json.dumps({"correlation_matrix": json.loads(report), "ranked_vulnerabilities": ranked}, indent=4)
         return report
 
 
@@ -240,20 +279,23 @@ def main():
                 cve_ids = [line.strip() for line in f if line.strip()] # remove empty lines
         except FileNotFoundError:
             logging.error(f"CVE file not found: {args.cve_file}")
-            return
+            sys.exit(1)
         except Exception as e:
             logging.error(f"Error reading CVE file: {e}")
-            return
+            sys.exit(1)
     else:
         print("Error: No CVE IDs provided.  Please use -c or -f to specify CVEs.")
-        return
+        sys.exit(1)
 
 
     # Input validation: basic CVE ID format check
     invalid_cves = [cve for cve in cve_ids if not cve.startswith("CVE-")]
     if invalid_cves:
         logging.error(f"Invalid CVE IDs found: {invalid_cves}.  Please ensure CVE IDs start with 'CVE-'.")
-        return
+        sys.exit(1)
+    if not cve_ids:
+        print("Error: No CVE IDs provided.  Please use -c or -f to specify CVEs.")
+        sys.exit(1)
 
 
 
@@ -261,12 +303,18 @@ def main():
     try:
         correlation_matrix = VulnCorrelationMatrix(cve_ids=cve_ids, nvd_api_key=args.nvd_api_key)
         correlation_matrix.aggregate_vulnerability_data()
+        if not any(correlation_matrix.vulnerability_data.get(cve_id) for cve_id in cve_ids):
+            print("No vulnerability data was aggregated for any supplied CVE ID; no correlation report was produced.")
+            sys.exit(1)
         correlation_matrix.correlate_vulnerabilities()
         report = correlation_matrix.generate_report(output_format=args.output)
         print(report)
 
+    except SystemExit:
+        raise
     except Exception as e:
-        logging.exception("An unexpected error occurred during processing:")  # Print full traceback
+        logging.exception("An unexpected error occurred during processing:")
+        sys.exit(1)
 
 
 
